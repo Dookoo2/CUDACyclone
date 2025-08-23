@@ -93,7 +93,24 @@ Total threads: 16777216
 ======== Phase-1: Brooteforce =========================
 Time: 30.1 s | Speed: 6038.9 Mkeys/s | Count: 182904267648 | Progress: 0.00 %
 ```
+**RTX5090**
+```bash
+./CUDACyclone --range 200000000000:3fffffffffff --address 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP —-grid 128,256
+======== PrePhase: GPU Information ====================
+Device               : NVIDIA GeForce RTX 5090 (compute 12.0)
+SM                   : 170
+ThreadsPerBlock      : 256
+Blocks               : 1024
+Points batch size    : 128
+Batches/SM           : 8
+Memory utilization   : 1.7% (557.3 MB / 31.4 GB)
+------------------------------------------------------- 
+Total threads        : 262144
 
+======== Phase-1: Brooteforce =========================
+Time: 7.0 s | Speed: 8408.0 Mkeys/s | Count: 58545467200 | Progress: 0.17 %
+
+```
 ## 🛠️ Getting Started
 To get started with CUDACyclone, clone the repository and type **make**  
 For totaly clean system (big thanks for **dev_nullish**):
