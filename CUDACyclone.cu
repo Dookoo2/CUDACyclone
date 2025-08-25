@@ -33,35 +33,38 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
     return f == FOUND_READY;
 }
 
-#ifndef MAX_BATCH_SIZE 
-#define MAX_BATCH_SIZE 512 
-#endif 
-#ifndef WARP_SIZE 
-#define WARP_SIZE 32 
-#endif 
+#ifndef MAX_BATCH_SIZE
+#define MAX_BATCH_SIZE 512
+#endif
+#ifndef WARP_SIZE
+#define WARP_SIZE 32
+#endif
 
-__constant__ uint64_t c_pGx[MAX_BATCH_SIZE * 4]; 
+__constant__ uint64_t c_pGx[MAX_BATCH_SIZE * 4];
 __constant__ uint64_t c_pGy[MAX_BATCH_SIZE * 4];
 
 __launch_bounds__(256, 2)
-__global__ void kernel_point_add_and_check(
-    const uint64_t* __restrict__ Px,
-    const uint64_t* __restrict__ Py,
-    uint64_t* __restrict__ Rx,
-    uint64_t* __restrict__ Ry,
-    const uint64_t* __restrict__ start_scalars,
-    const uint64_t* __restrict__ counts256,
+__global__ void kernel_point_add_and_check_sliced(
+    const uint64_t* __restrict__ Px,      
+    const uint64_t* __restrict__ Py,    
+    uint64_t* __restrict__ Rx,           
+    uint64_t* __restrict__ Ry,            
+    uint64_t* __restrict__ start_scalars, 
+    uint64_t* __restrict__ counts256,    
     uint64_t threadsTotal,
-    uint32_t batch_size,                   
+    uint32_t batch_size,                 
+    uint32_t max_batches_per_launch,     
+    int do_initial_anchor_check,          
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
-    unsigned long long* __restrict__ hashes_accum
+    unsigned long long* __restrict__ hashes_accum,
+    unsigned int* __restrict__ d_any_left 
 )
 {
     const int batch = (int)batch_size;
-    if (batch <= 0 || (batch & 1)) return;    
-    if (batch > MAX_BATCH_SIZE) return;        
-    const int half  = batch >> 1;
+    if (batch <= 0 || (batch & 1)) return;
+    if (batch > MAX_BATCH_SIZE) return;
+    const int half = batch >> 1;
 
     extern __shared__ uint64_t s_mem[];
     uint64_t* s_pGx = s_mem;
@@ -72,7 +75,7 @@ __global__ void kernel_point_add_and_check(
         s_pGx[idx] = c_pGx[idx];
         s_pGy[idx] = c_pGy[idx];
     }
-    __syncthreads(); 
+    __syncthreads();
 
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
@@ -110,12 +113,15 @@ __global__ void kernel_point_add_and_check(
 
     if ((rem[0] | rem[1] | rem[2] | rem[3]) == 0ull) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { Rx[gid*4+i] = x1[i]; Ry[gid*4+i] = y1[i]; }
+        for (int i = 0; i < 4; ++i) {
+            Rx[gid*4+i] = x1[i];
+            Ry[gid*4+i] = y1[i];
+        }
         WARP_FLUSH_HASHES();
         return;
     }
 
-    {
+    if (do_initial_anchor_check) {
         uint8_t tmp_hash[20];
         uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
         getHash160_33_from_limbs(prefix, x1, tmp_hash);
@@ -139,16 +145,29 @@ __global__ void kernel_point_add_and_check(
             }
             __syncwarp(full_mask);
             WARP_FLUSH_HASHES();
+            return; 
+        }
+
+        sub256_u64_inplace(rem, 1ull);
+        if ((rem[0] | rem[1] | rem[2] | rem[3]) == 0ull) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                Rx[gid*4+i] = x1[i];
+                Ry[gid*4+i] = y1[i];
+                counts256[gid*4+i] = rem[i];
+                start_scalars[gid*4+i] = base_scalar[i];
+            }
+            WARP_FLUSH_HASHES();
             return;
         }
     }
 
-    sub256_u64_inplace(rem, 1ull);
+    uint32_t batches_done = 0;
 
-    while (ge256_u64(rem, (uint64_t)batch)) {
+    while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)batch)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        uint64_t subp[MAX_BATCH_SIZE/2][4]; 
+        uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
 #pragma unroll
@@ -325,10 +344,20 @@ __global__ void kernel_point_add_and_check(
         }
 
         sub256_u64_inplace(rem, (uint64_t)batch);
+        ++batches_done;
     }
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) { Rx[gid*4+i]=x1[i]; Ry[gid*4+i]=y1[i]; }
+    for (int i = 0; i < 4; ++i) {
+        Rx[gid*4+i] = x1[i];
+        Ry[gid*4+i] = y1[i];
+        counts256[gid*4+i] = rem[i];
+        start_scalars[gid*4+i] = base_scalar[i];
+    }
+
+    if ((rem[0] | rem[1] | rem[2] | rem[3]) != 0ull) {
+        atomicAdd(d_any_left, 1u);
+    }
 
     WARP_FLUSH_HASHES();
 
@@ -342,7 +371,8 @@ int main(int argc, char** argv) {
     std::string address_b58;
     bool grid_provided = false;
     uint32_t runtime_points_batch_size = 128;
-    uint32_t runtime_batches_per_sm    = 8;
+    uint32_t runtime_batches_per_sm    = 8;   
+    uint32_t slices_per_launch         = 64; 
 
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
@@ -385,11 +415,20 @@ int main(int argc, char** argv) {
             runtime_batches_per_sm    = b;
             grid_provided = true;
         }
+        else if (arg == "--slices" && i + 1 < argc) {
+            char* endp=nullptr;
+            unsigned long v = std::strtoul(argv[++i], &endp, 10);
+            if (*endp != '\0' || v == 0ul || v > (1ul<<20)) {
+                std::cerr << "Error: --slices must be in 1.." << (1u<<20) << "\n";
+                return EXIT_FAILURE;
+            }
+            slices_per_launch = (uint32_t)v;
+        }
     }
 
     if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B]\n";
+                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]\n";
         return EXIT_FAILURE;
     }
     if (!target_hash_hex.empty() && !address_b58.empty()) {
@@ -426,6 +465,10 @@ int main(int argc, char** argv) {
     }
     if (runtime_points_batch_size > 512u) {
         std::cerr << "Error: batch size must be <= 512 (kernel limit).\n";
+        return EXIT_FAILURE;
+    }
+    if (slices_per_launch == 0) {
+        std::cerr << "Error: slices_per_launch must be > 0\n";
         return EXIT_FAILURE;
     }
 
@@ -578,6 +621,7 @@ int main(int argc, char** argv) {
     int *d_found_flag=nullptr;
     FoundResult *d_found_result=nullptr;
     unsigned long long *d_hashes_accum=nullptr;
+    unsigned int *d_any_left=nullptr;
 
     cudaMalloc(&d_start_scalars, threadsTotal * 4 * sizeof(uint64_t));
     cudaMalloc(&d_Px, threadsTotal * 4 * sizeof(uint64_t));
@@ -588,6 +632,7 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_found_flag, sizeof(int));
     cudaMalloc(&d_found_result, sizeof(FoundResult));
     cudaMalloc(&d_hashes_accum, sizeof(unsigned long long));
+    cudaMalloc(&d_any_left, sizeof(unsigned int));
 
     cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_counts256,     h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
@@ -644,66 +689,95 @@ int main(int argc, char** argv) {
     std::cout << std::left << std::setw(20) << "Blocks"            << " : " << blocks << "\n";
     std::cout << std::left << std::setw(20) << "Points batch size" << " : " << runtime_points_batch_size << "\n";
     std::cout << std::left << std::setw(20) << "Batches/SM"        << " : " << runtime_batches_per_sm << "\n";
+    std::cout << std::left << std::setw(20) << "Batches/launch"    << " : " << slices_per_launch << " (per thread)\n";
     std::cout << std::left << std::setw(20) << "Memory utilization"<< " : "
               << std::fixed << std::setprecision(1) << util << "% ("
               << human_bytes((double)usedB) << " / " << human_bytes((double)totalB) << ")\n";
     std::cout << "------------------------------------------------------- \n";
     std::cout << std::left << std::setw(20) << "Total threads"     << " : " << threadsTotal << "\n\n";
 
-    std::cout << "======== Phase-1: Brooteforce =========================\n";
+    std::cout << "======== Phase-1: BruteForce (sliced) =================\n";
 
     cudaStream_t streamKernel;
     cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking);
 
-    cudaFuncSetCacheConfig(kernel_point_add_and_check, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(kernel_point_add_and_check_sliced, cudaFuncCachePreferShared);
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
     unsigned long long lastHashes = 0ull;
 
-    size_t sharedBytes = (size_t)runtime_points_batch_size * 4 * sizeof(uint64_t) * 2; // pGx + pGy
+    size_t sharedBytes = (size_t)runtime_points_batch_size * 4 * sizeof(uint64_t) * 2;
 
-    kernel_point_add_and_check<<<blocks, threadsPerBlock, sharedBytes, streamKernel>>>(
-        d_Px, d_Py, d_Rx, d_Ry,
-        d_start_scalars,
-        d_counts256,
-        threadsTotal,
-        runtime_points_batch_size,
-        d_found_flag, d_found_result,
-        d_hashes_accum
-    );
-    cudaGetLastError();
+    bool first_launch = true;
+    bool stop_all = false;
 
-    long double total_keys_ld = ld_from_u256(range_len);
-    bool kernel_done = false;
-    while (!kernel_done) {
-        auto now = std::chrono::high_resolution_clock::now();
-        double dt = std::chrono::duration<double>(now - tLast).count();
-        if (dt >= 1.0) {
-            unsigned long long h_hashes = 0ull;
-            cudaMemcpy(&h_hashes, d_hashes_accum, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-            double delta = (double)(h_hashes - lastHashes);
-            double mkeys = delta / (dt * 1e6);
-            double elapsed = std::chrono::duration<double>(now - t0).count();
-            long double prog = total_keys_ld > 0.0L ? ((long double)h_hashes / total_keys_ld) * 100.0L : 0.0L;
-            if (prog > 100.0L) prog = 100.0L;
-            std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
-                      << " s | Speed: " << std::fixed << std::setprecision(1) << mkeys
-                      << " Mkeys/s | Count: " << h_hashes
-                      << " | Progress: " << std::fixed << std::setprecision(2) << (double)prog << " %";
-            std::cout.flush();
-            lastHashes = h_hashes;
-            tLast = now;
+    while (!stop_all) {
+        unsigned int zeroU = 0u;
+        cudaMemcpyAsync(d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, streamKernel);
+
+        kernel_point_add_and_check_sliced<<<blocks, threadsPerBlock, sharedBytes, streamKernel>>>(
+            d_Px, d_Py, d_Rx, d_Ry,
+            d_start_scalars,
+            d_counts256,
+            threadsTotal,
+            runtime_points_batch_size,
+            slices_per_launch,
+            first_launch ? 1 : 0,
+            d_found_flag, d_found_result,
+            d_hashes_accum,
+            d_any_left
+        );
+        cudaGetLastError();
+
+        while (true) {
+            auto now = std::chrono::high_resolution_clock::now();
+            double dt = std::chrono::duration<double>(now - tLast).count();
+            if (dt >= 1.0) {
+                unsigned long long h_hashes = 0ull;
+                cudaMemcpy(&h_hashes, d_hashes_accum, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+                double delta = (double)(h_hashes - lastHashes);
+                double mkeys = delta / (dt * 1e6);
+                double elapsed = std::chrono::duration<double>(now - t0).count();
+                long double total_keys_ld = ld_from_u256(range_len);
+                long double prog = total_keys_ld > 0.0L ? ((long double)h_hashes / total_keys_ld) * 100.0L : 0.0L;
+                if (prog > 100.0L) prog = 100.0L;
+                std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
+                          << " s | Speed: " << std::fixed << std::setprecision(1) << mkeys
+                          << " Mkeys/s | Count: " << h_hashes
+                          << " | Progress: " << std::fixed << std::setprecision(2) << (double)prog << " %";
+                std::cout.flush();
+                lastHashes = h_hashes;
+                tLast = now;
+            }
+
+            int host_found = 0;
+            cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
+            if (host_found == FOUND_READY) { stop_all = true; break; }
+
+            cudaError_t qs = cudaStreamQuery(streamKernel);
+            if (qs == cudaSuccess) break;
+            else if (qs != cudaErrorNotReady) { cudaGetLastError(); stop_all = true; break; }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        int host_found = 0;
-        cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
-        if (host_found == FOUND_READY) break;
 
-        cudaError_t qs = cudaStreamQuery(streamKernel);
-        if (qs == cudaSuccess) kernel_done = true;
-        else if (qs != cudaErrorNotReady) { cudaGetLastError(); break; }
+        cudaStreamSynchronize(streamKernel);
+        std::cout.flush();
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (stop_all) break;
+
+        unsigned int h_any = 0u;
+        cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+        std::swap(d_Px, d_Rx);
+        std::swap(d_Py, d_Ry);
+
+        first_launch = false;
+
+        if (h_any == 0u) {
+            break;
+        }
     }
 
     cudaDeviceSynchronize();
@@ -729,6 +803,7 @@ int main(int argc, char** argv) {
     cudaFree(d_found_flag);
     cudaFree(d_found_result);
     cudaFree(d_hashes_accum);
+    cudaFree(d_any_left);
     cudaStreamDestroy(streamKernel);
 
     delete[] h_start_scalars;
