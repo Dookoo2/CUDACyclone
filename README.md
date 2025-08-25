@@ -79,20 +79,25 @@ Public Key    : 03C060E1E3771CBECCB38E119C2414702F3F5181A89652538851D2E3886BDD70
 
 **RTX4090**
 ```bash
-./CUDACyclone --range 400000000000000000:7fffffffffffffffff --address 1PWo3JeB9jrGwfHDNpdGK54CRas/fsVzXU --grid 512,512
-======= PrePhase: GPU Information
-Device: NVIDIA GeForce RTX 4090 (compute 8.9)
+./CUDACyclone --range 200000000000:3fffffffffff --address 1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP --grid 128,128 --slices 16
+======== PrePhase: GPU Information ====================
+Device               : NVIDIA GeForce RTX 4090 (compute 8.9)
 SM                   : 128
 ThreadsPerBlock      : 256
-Blocks               : 65536
-Points batch size    : 512
-Batches/SM           : 512
-Memory utilization   : 14.5% (3.42 GB / 23.5 GB)
-------------------------------------------------------- 
-Total threads: 16777216
+Blocks               : 16384
+Points batch size    : 128
+Batches/SM           : 128
+Batches/launch       : 16 (per thread)
+Memory utilization   : 4.8% (1.14 GB / 23.6 GB)
+-------------------------------------------------------
+Total threads        : 4194304
 
-======== Phase-1: Brooteforce =========================
-Time: 30.1 s | Speed: 6038.9 Mkeys/s | Count: 182904267648 | Progress: 0.00 %
+======== Phase-1: BruteForce (sliced) =================
+Time: 393.7 s | Speed: 6127.4 Mkeys/s | Count: 2421341587872 | Progress: 6.88 %
+
+======== FOUND MATCH! =================================
+Private Key   : 00000000000000000000000000000000000000000000000000002EC18388D544
+Public Key    : 03FD5487722D2576CB6D7081426B66A3E2986C1CE8358D479063FB5F2BB6DD5849
 ```
 **RTX5090**
 ```bash
