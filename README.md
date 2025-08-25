@@ -31,6 +31,7 @@ Despite its simplicity, Cyclone CUDA leverages **massive GPU parallelism** to ac
 - **--address**: P2PKH address.
 - **--target-hash160**: the same as address but hash160.
 - **--grid**: very usefull parameter. Example --grid 512,512 - first 512 - number of points each thread will process in one batch (Points batch size)., second 512 - number of threads in one group (Threads per batch).
+- **--slices**: batch per thread for one kernel launch.
 
 ---
 
