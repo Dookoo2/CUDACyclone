@@ -34,7 +34,7 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 }
 
 #ifndef MAX_BATCH_SIZE 
-#define MAX_BATCH_SIZE 256 
+#define MAX_BATCH_SIZE 512 
 #endif 
 #ifndef WARP_SIZE 
 #define WARP_SIZE 32 
