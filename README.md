@@ -118,6 +118,28 @@ Total threads        : 262144
 Time: 7.0 s | Speed: 8408.0 Mkeys/s | Count: 58545467200 | Progress: 0.17 %
 
 ```
+**RTX3070 mobile**
+```bash
+./CUDACyclone --range 2000000000:3FFFFFFFFF --address 1HBtApAFA9B2YZw3G2YKSMCtb3dVnjuNe2 --grid 512,256
+======== PrePhase: GPU Information ====================
+Device               : NVIDIA GeForce RTX 3070 Laptop GPU (compute 8.6)
+SM                   : 40
+ThreadsPerBlock      : 256
+Blocks               : 8192
+Points batch size    : 512
+Batches/SM           : 256
+Batches/launch       : 64 (per thread)
+Memory utilization   : 64.0% (5.12 GB / 8.00 GB)
+-------------------------------------------------------
+Total threads        : 2097152
+
+======== Phase-1: BruteForce (sliced) =================
+Time: 61.2 s | Speed: 1234.3 Mkeys/s | Count: 72707573152 | Progress: 52.90 %
+
+======== FOUND MATCH! =================================
+Private Key   : 00000000000000000000000000000000000000000000000000000022382FACD0
+Public Key    : 03C060E1E3771CBECCB38E119C2414702F3F5181A89652538851D2E3886BDD70C6
+```
 ## 🛠️ Getting Started
 To get started with CUDACyclone, clone the repository and type **make**  
 For totaly clean system (big thanks for **dev_nullish**):
