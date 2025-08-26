@@ -34,14 +34,17 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 }
 
 #ifndef MAX_BATCH_SIZE
-#define MAX_BATCH_SIZE 128
+#define MAX_BATCH_SIZE 1024
 #endif
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
 
-__constant__ uint64_t c_pGx[MAX_BATCH_SIZE * 4];
-__constant__ uint64_t c_pGy[MAX_BATCH_SIZE * 4];
+__device__ uint64_t g_pGx[MAX_BATCH_SIZE * 4];
+__device__ uint64_t g_pGy[MAX_BATCH_SIZE * 4];
+
+__device__ uint64_t g_Jx[4];
+__device__ uint64_t g_Jy[4];
 
 __launch_bounds__(256, 2)
 __global__ void kernel_point_add_and_check_sliced(
@@ -65,17 +68,6 @@ __global__ void kernel_point_add_and_check_sliced(
     if (batch <= 0 || (batch & 1)) return;
     if (batch > MAX_BATCH_SIZE) return;
     const int half = batch >> 1;
-
-    extern __shared__ uint64_t s_mem[];
-    uint64_t* s_pGx = s_mem;
-    uint64_t* s_pGy = s_pGx + (size_t)batch * 4;
-
-    const int total_limbs = batch * 4;
-    for (int idx = threadIdx.x; idx < total_limbs; idx += blockDim.x) {
-        s_pGx[idx] = c_pGx[idx];
-        s_pGy[idx] = c_pGy[idx];
-    }
-    __syncthreads();
 
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
@@ -164,30 +156,30 @@ __global__ void kernel_point_add_and_check_sliced(
 
     uint32_t batches_done = 0;
 
-    while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)batch)) {
+while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)batch)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] = s_pGx[(size_t)(batch - 1) * 4 + j];
+        for (int j = 0; j < 4; ++j) acc[j] = g_Jx[j];
         ModSub256(acc, acc, x1);
 #pragma unroll
         for (int j = 0; j < 4; ++j) subp[half - 1][j] = acc[j];
 
-        for (int i = half - 2; i >= 0; --i) {
+        for (int i = half - 1; i > 0; --i) {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) tmp[j] = s_pGx[(size_t)(i + 1) * 4 + j];
+            for (int j = 0; j < 4; ++j) tmp[j] = g_pGx[(size_t)i * 4 + j];
             ModSub256(tmp, tmp, x1);
             _ModMult(acc, acc, tmp);
 #pragma unroll
-            for (int j = 0; j < 4; ++j) subp[i][j] = acc[j];
+            for (int j = 0; j < 4; ++j) subp[i - 1][j] = acc[j];
         }
 
         uint64_t d0[4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) d0[j] = s_pGx[0 * 4 + j];
+        for (int j = 0; j < 4; ++j) d0[j] = g_pGx[0 * 4 + j];
         ModSub256(d0, d0, x1);
 
         uint64_t inverse[5];
@@ -197,14 +189,17 @@ __global__ void kernel_point_add_and_check_sliced(
         inverse[4] = 0ULL;
         _ModInv(inverse);
 
-        for (int i = 0; i < half; ++i) {
+        uint64_t syn[4];
+        ModNeg256(syn, y1);
+
+        for (int i = 0; i < half - 1; ++i) {
             uint64_t dx[4];
-            _ModMult(dx, subp[i], inverse);
+            _ModMult(dx, subp[i], inverse); 
 
             {
                 uint64_t px_i[4], py_i[4];
 #pragma unroll
-                for (int j = 0; j < 4; ++j) { px_i[j] = s_pGx[(size_t)i*4 + j]; py_i[j] = s_pGy[(size_t)i*4 + j]; }
+                for (int j = 0; j < 4; ++j) { px_i[j] = g_pGx[(size_t)i*4 + j]; py_i[j] = g_pGy[(size_t)i*4 + j]; }
 
                 uint64_t lam[4], x3[4], s[4];
                 ModSub256(s, py_i, y1);
@@ -259,7 +254,7 @@ __global__ void kernel_point_add_and_check_sliced(
             {
                 uint64_t pxn[4], pyn[4];
 #pragma unroll
-                for (int j=0;j<4;++j){ pxn[j]=s_pGx[(size_t)i*4 + j]; pyn[j]=s_pGy[(size_t)i*4 + j]; }
+                for (int j=0;j<4;++j){ pxn[j]=g_pGx[(size_t)i*4 + j]; pyn[j]=g_pGy[(size_t)i*4 + j]; }
                 ModNeg256(pyn, pyn);
 
                 uint64_t lam[4], x3[4], s[4];
@@ -311,30 +306,86 @@ __global__ void kernel_point_add_and_check_sliced(
             }
 
 #pragma unroll
-            for (int j = 0; j < 4; ++j) tmp[j] = s_pGx[(size_t)i*4 + j];
+            for (int j = 0; j < 4; ++j) tmp[j] = g_pGx[(size_t)i*4 + j];
             ModSub256(tmp, tmp, x1);
             _ModMult(inverse, tmp);
         }
 
         {
-            uint64_t px_last[4], py_last[4];
+            uint64_t dx_last[4];
+            _ModMult(dx_last, subp[half - 1], inverse); 
+
+            uint64_t pxn[4], pyn[4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) { px_last[j]=s_pGx[(size_t)(batch-1)*4 + j]; py_last[j]=s_pGy[(size_t)(batch-1)*4 + j]; }
+            for (int j=0;j<4;++j){ pxn[j]=g_pGx[(size_t)(half-1)*4 + j]; pyn[j]=g_pGy[(size_t)(half-1)*4 + j]; }
+            ModNeg256(pyn, pyn);
 
             uint64_t lam[4], x3[4], s[4];
-            ModSub256(s, py_last, y1);
-            _ModMult(lam, s, inverse);
-
+            ModSub256(s, pyn, y1);
+            _ModMult(lam, s, dx_last);
             _ModSqr(x3, lam);
             ModSub256(x3, x3, x1);
-            ModSub256(x3, x3, px_last);
-
+            ModSub256(x3, x3, pxn);
             ModSub256(s, x1, x3);
             _ModMult(s, s, lam);
-            ModSub256(s, s, y1);
+            uint8_t parityY;
+            ModSub256isOdd(s, y1, &parityY);
+
+            uint8_t h20[20];
+            getHash160_33_from_limbs(parityY ? 0x03 : 0x02, x3, h20);
+            ++local_hashes; MAYBE_WARP_FLUSH();
+
+            bool pref = hash160_prefix_equals(h20, target_prefix);
+            if (__any_sync(full_mask, pref)) {
+                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
+
+                        uint64_t fs[4];
+#pragma unroll
+                        for (int k=0;k<4;++k) fs[k]=base_scalar[k];
+                        uint64_t borrow=(uint64_t)(half);
+#pragma unroll
+                        for (int k=0;k<4 && borrow;++k){ uint64_t old=fs[k]; fs[k]=old-borrow; borrow=(old<borrow)?1:0; }
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 
 #pragma unroll
-            for (int j=0;j<4;++j){ x1[j]=x3[j]; y1[j]=s[j]; }
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x3[k];
+
+                        ModSub256(s, x1, x3);
+                        _ModMult(s, s, lam);
+                        uint64_t y3_full[4]; ModSub256(y3_full, s, y1);
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3_full[k];
+
+                        __threadfence_system();
+                        atomicExch(d_found_flag, FOUND_READY);
+                    }
+                }
+                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
+            }
+
+#pragma unroll
+            for (int j = 0; j < 4; ++j) tmp[j] = g_pGx[(size_t)(half-1)*4 + j];
+            ModSub256(tmp, tmp, x1);
+            _ModMult(inverse, tmp);
+
+            uint64_t dyJ[4], lamJ[4], xJ[4], sJ[4];
+            ModSub256(dyJ, g_Jy, y1);
+            _ModMult(lamJ, dyJ, inverse);
+
+            _ModSqr(xJ, lamJ);
+            ModSub256(xJ, xJ, x1);
+            ModSub256(xJ, xJ, g_Jx);
+
+            ModSub256(sJ, x1, xJ);
+            _ModMult(sJ, sJ, lamJ);
+            ModSub256(sJ, sJ, y1);
+
+#pragma unroll
+            for (int j=0;j<4;++j){ x1[j]=xJ[j]; y1[j]=sJ[j]; }
         }
 
         {
@@ -463,8 +514,8 @@ int main(int argc, char** argv) {
         std::cerr << "Error: batch size must be even and a power of two.\n";
         return EXIT_FAILURE;
     }
-    if (runtime_points_batch_size > 128u) {
-        std::cerr << "Error: batch size must be <= 128.\n";
+    if (runtime_points_batch_size > MAX_BATCH_SIZE) {
+        std::cerr << "Error: batch size must be <= " << MAX_BATCH_SIZE << ".\n";
         return EXIT_FAILURE;
     }
     if (slices_per_launch == 0) {
@@ -525,6 +576,9 @@ int main(int argc, char** argv) {
     cudaError_t err = cudaGetDevice(&device);
     if (err != cudaSuccess) { std::cerr << "cudaGetDevice error\n"; return EXIT_FAILURE; }
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) { std::cerr << "cudaGetDeviceProperties error\n"; return EXIT_FAILURE; }
+
+    size_t stackSize = 64 * 1024;
+    cudaDeviceSetLimit(cudaLimitStackSize, stackSize);
 
     int threadsPerBlock = 256;
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock = prop.maxThreadsPerBlock;
@@ -668,8 +722,11 @@ int main(int argc, char** argv) {
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_pG_scalars, d_pGx, d_pGy, (int)B);
         cudaDeviceSynchronize();
 
-        cudaMemcpyToSymbol(c_pGx, d_pGx, (size_t)B * 4 * sizeof(uint64_t), 0, cudaMemcpyDeviceToDevice);
-        cudaMemcpyToSymbol(c_pGy, d_pGy, (size_t)B * 4 * sizeof(uint64_t), 0, cudaMemcpyDeviceToDevice);
+        cudaMemcpyToSymbol(g_pGx, d_pGx, (size_t)B * 4 * sizeof(uint64_t), 0, cudaMemcpyDeviceToDevice);
+        cudaMemcpyToSymbol(g_pGy, d_pGy, (size_t)B * 4 * sizeof(uint64_t), 0, cudaMemcpyDeviceToDevice);
+
+		cudaMemcpyToSymbol(g_Jx, d_pGx + (size_t)(B - 1) * 4, 4 * sizeof(uint64_t), 0, cudaMemcpyDeviceToDevice);
+		cudaMemcpyToSymbol(g_Jy, d_pGy + (size_t)(B - 1) * 4, 4 * sizeof(uint64_t), 0, cudaMemcpyDeviceToDevice);
 
         cudaFree(d_pG_scalars);
         delete[] h_scal;
@@ -700,14 +757,13 @@ int main(int argc, char** argv) {
 
     cudaStream_t streamKernel;
     cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking);
-
-    cudaFuncSetCacheConfig(kernel_point_add_and_check_sliced, cudaFuncCachePreferShared);
+    cudaFuncSetCacheConfig(kernel_point_add_and_check_sliced, cudaFuncCachePreferL1);
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
     unsigned long long lastHashes = 0ull;
 
-    size_t sharedBytes = (size_t)runtime_points_batch_size * 4 * sizeof(uint64_t) * 2;
+    size_t sharedBytes = 0;
 
     bool first_launch = true;
     bool stop_all = false;
