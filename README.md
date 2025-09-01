@@ -11,7 +11,7 @@ It was designed with clarity and minimalism in mind — making it easy to **comp
 
 Despite its simplicity, Cyclone CUDA leverages **massive GPU parallelism** to achieve extreme performance in elliptic curve computations and Hash160 pipelines. 
 
-⚠️ **Achieved 6.5Gkeys/s on RTX4090.**  
+⚠️ **Achieved 6.5Gkeys/s on RTX4090. 8.6Gkeys/s on RTX5090.**  
 ⚠️ **For preventing decresasing GPU speed you need to use --slices option and not to start brooteforce with 256 points per batch! THe best tune for 4090 is --grid 128,128 --slices 16**
 
 ---
