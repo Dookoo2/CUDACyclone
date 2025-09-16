@@ -582,9 +582,6 @@ __global__ void kernel_point_add_and_check_sliced(
     #undef FLUSH_THRESHOLD
 }
 
-static inline bool is_zero_256_host(const uint64_t a[4]) {
-    return (a[0]|a[1]|a[2]|a[3]) == 0ull;
-}
 
 static void divmod_256_by_u64_safe(const uint64_t a[4], uint64_t d,
                                    uint64_t q[4], uint64_t &r)
