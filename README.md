@@ -16,6 +16,23 @@ Despite its simplicity, Cyclone CUDA leverages **massive GPU parallelism** to ac
 
 ---
 
+## ⚠️ Problem with a key skipping was fixed!
+My software was skipping keys earlier.  
+I fixed this problem, to make sure that keys are not skipped I wrote a small script in python.   
+The script is called **proof.py**. The script generates random scalars in a given range, calculates addresses, then runs Cyclone and at the end of the work shows how many keys were found and how many were not found. All should be found.
+Usage
+```
+usage: proof.py [-h] --range RANGE_ARG [--cyclone-path CYCLONE_PATH] [--grid GRID_ARG] [--keys KEYS] [--tests TESTS] [--timeout TIMEOUT]
+```
+Sample start
+```
+python3 proof.py --range 80000000:FFFFFFFF --tests 30 
+```
+Results
+```
+Done. Results in cyclone_tests_results.txt. Successes=10 Failures=0
+```
+
 ## 🚀 Key Features
 
 - **GPU Acceleration**: Optimized for NVIDIA GPUs with full CUDA support.
