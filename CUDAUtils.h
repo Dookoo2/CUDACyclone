@@ -112,6 +112,10 @@ static __device__ __forceinline__ bool hash160_matches_prefix_then_full(
     return true;
 }
 
+__device__ __forceinline__ bool eq256_u64(const uint64_t a[4], uint64_t b) {
+    return (a[0]==b) & (a[1]==0ull) & (a[2]==0ull) & (a[3]==0ull);
+}
+
 static __device__ __forceinline__ bool hash160_prefix_equals(
     const uint8_t* __restrict__ h,
     uint32_t target_prefix)
@@ -119,10 +123,9 @@ static __device__ __forceinline__ bool hash160_prefix_equals(
     return load_u32_le(h) == target_prefix;
 }
 
+// вспомогательная: a (256-бит) >= b (u64)?
 __device__ __forceinline__ bool ge256_u64(const uint64_t a[4], uint64_t b) {
-    if (a[3] != 0ull) return true;     
-    if (a[2] != 0ull) return true;
-    if (a[1] != 0ull) return true;
+    if (a[3] | a[2] | a[1]) return true;  // >= 2^64
     return a[0] >= b;
 }
 
@@ -178,6 +181,5 @@ static inline std::string formatCompressedPubHex(const uint64_t Rx[4], const uin
     for (int i=0;i<33;++i){ s[2*i]=hexd[(out[i]>>4)&0xF]; s[2*i+1]=hexd[out[i]&0xF]; }
     return s;
 }
-
 
 
