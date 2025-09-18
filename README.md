@@ -26,11 +26,22 @@ usage: proof.py [-h] --range RANGE_ARG [--cyclone-path CYCLONE_PATH] [--grid GRI
 ```
 Sample start
 ```
-python3 proof.py --range 80000000:FFFFFFFF --tests 30 
+python3 proof.py --range 200000000:3FFFFFFFF --grid 512,512
 ```
 Results
 ```
-Done. Results in cyclone_tests_results.txt. Successes=10 Failures=0
+================ Summary by blocks ================
+Range start A (start+2k)           : total= 128  success= 128  fail=   0
+Range start B (start+1+2k)         : total= 128  success= 128  fail=   0
+Range end A (end-2k)               : total= 128  success= 128  fail=   0
+Range end B (end-1-2k)             : total= 128  success= 128  fail=   0
+Full mod 512 residue coverage      : total= 256  success= 256  fail=   0
+Random Q1 (0–25%)                  : total=  20  success=  20  fail=   0
+Random Q2 (25–50%)                 : total=  20  success=  20  fail=   0
+Random Q3 (50–75%)                 : total=  20  success=  20  fail=   0
+Random Q4 (75–100%)                : total=  20  success=  20  fail=   0
+
+Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
 ```
 
 ## 🚀 Key Features
