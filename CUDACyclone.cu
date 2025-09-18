@@ -631,7 +631,7 @@ int main(int argc, char** argv) {
               << human_bytes((double)usedB) << " / " << human_bytes((double)totalB) << ")\n";
     std::cout << "------------------------------------------------------- \n";
     std::cout << std::left << std::setw(20) << "Total threads"     << " : " << (uint64_t)threadsTotal << "\n\n";
-    std::cout << "======== Phase-1: BruteForce (centered full batches, sliced, global→shared) =====\n";
+    std::cout << "======== Phase-1: BruteForce (sliced) =================\n";
 
     cudaStream_t streamKernel;
     cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking);
