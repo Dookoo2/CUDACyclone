@@ -11,12 +11,17 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <csignal>  
+#include <atomic>
 
 #include "CUDAMath.h"
 #include "sha256.h"
 #include "CUDAHash.cuh"
 #include "CUDAUtils.h"
 #include "CUDAStructures.h"
+
+static volatile sig_atomic_t g_sigint = 0;
+static void handle_sigint(int) { g_sigint = 1; }
 
 __device__ __forceinline__ int load_found_flag_relaxed(const int* p) {
     return *((const volatile int*)p);
@@ -40,17 +45,17 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 
 __launch_bounds__(256, 2)
 __global__ void kernel_point_add_and_check_sliced(
-    const uint64_t* __restrict__ Px,            // P(S) центры
+    const uint64_t* __restrict__ Px,          
     const uint64_t* __restrict__ Py,
-    uint64_t* __restrict__ Rx,                  // новый центр после giant step
+    uint64_t* __restrict__ Rx,               
     uint64_t* __restrict__ Ry,
-    uint64_t* __restrict__ start_scalars,       // S (центр) для потока
-    uint64_t* __restrict__ counts256,           // оставшиеся ключи (кратно B)
-    const uint64_t* __restrict__ pGx,           // глобальные pGx[k], k=1..B
-    const uint64_t* __restrict__ pGy,           // глобальные pGy[k], k=1..B
+    uint64_t* __restrict__ start_scalars,      
+    uint64_t* __restrict__ counts256,         
+    const uint64_t* __restrict__ pGx,       
+    const uint64_t* __restrict__ pGy,         
     uint64_t threadsTotal,
-    uint32_t batch_size,                        // B (чётная степень 2, <= MAX_BATCH_SIZE)
-    uint32_t max_batches_per_launch,            // slices per launch
+    uint32_t batch_size,                     
+    uint32_t max_batches_per_launch,         
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
     unsigned long long* __restrict__ hashes_accum,
@@ -61,7 +66,6 @@ __global__ void kernel_point_add_and_check_sliced(
     if (B <= 0 || (B & 1) || B > MAX_BATCH_SIZE) return;
     const int half = B >> 1;
 
-    // --- pG из глобальной → в динамическую shared ---
     extern __shared__ uint64_t s_mem[];
     uint64_t* s_pGx = s_mem;
     uint64_t* s_pGy = s_pGx + (size_t)B * 4;
@@ -92,7 +96,6 @@ __global__ void kernel_point_add_and_check_sliced(
     #define MAYBE_WARP_FLUSH()                                                               \
         do { if ((local_hashes & (FLUSH_THRESHOLD - 1u)) == 0u) WARP_FLUSH_HASHES(); } while (0)
 
-    // Загрузка центра и счётчика
     uint64_t Xc[4], Yc[4], S[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -113,11 +116,9 @@ __global__ void kernel_point_add_and_check_sliced(
 
     uint32_t batches_done = 0;
 
-    // Цикл только по полным батчам B (никаких хвостов)
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        // 0) центр батча (входит в B точек)
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(Yc[0] & 1ULL) ? 0x03 : 0x02;
@@ -144,7 +145,6 @@ __global__ void kernel_point_add_and_check_sliced(
             }
         }
 
-        // 1) префиксы/инверсия dx[1..half]
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
@@ -175,12 +175,11 @@ __global__ void kernel_point_add_and_check_sliced(
         inverse[4] = 0ULL;
         _ModInv(inverse);
 
-        // 2) перебор ±i: плюс для i=1..half-1, минус для i=1..half
+
         for (int i = 0; i < half; ++i) {
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // +i (исключаем +half, чтобы не дублировать со следующим батчем)
             if (i < (half - 1)) {
                 uint64_t px_i[4], py_i[4];
 #pragma unroll
@@ -229,7 +228,6 @@ __global__ void kernel_point_add_and_check_sliced(
                 }
             }
 
-            // -i (всегда)
             {
                 uint64_t pxn[4], pyn[4];
 #pragma unroll
@@ -279,14 +277,12 @@ __global__ void kernel_point_add_and_check_sliced(
                 }
             }
 
-            // inverse *= dx[i+1] (готовим к следующему i)
 #pragma unroll
             for (int j = 0; j < 4; ++j) tmp[j] = s_pGx[(size_t)i*4 + j];
             ModSub256(tmp, tmp, Xc);
             _ModMult(inverse, tmp);
         }
 
-        // 3) giant step: P += B*G
         {
             uint64_t Jx[4], Jy[4];
 #pragma unroll
@@ -306,7 +302,6 @@ __global__ void kernel_point_add_and_check_sliced(
             for (int j=0;j<4;++j){ Xc[j]=xJ[j]; Yc[j]=sJ[j]; }
         }
 
-        // 4) S += B, rem -= B
         {
             uint64_t addv=(uint64_t)B;
             for (int k=0;k<4 && addv;++k){ uint64_t old=S[k]; S[k]=old+addv; addv=(S[k]<old)?1ull:0ull; }
@@ -315,7 +310,6 @@ __global__ void kernel_point_add_and_check_sliced(
         ++batches_done;
     }
 
-    // write-back
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         Rx[gid*4+i] = Xc[i];
@@ -324,7 +318,7 @@ __global__ void kernel_point_add_and_check_sliced(
         start_scalars[gid*4+i] = S[i];
     }
     if ((rem[0] | rem[1] | rem[2] | rem[3]) != 0ull) {
-        atomicAdd(d_any_left, 1u); // остались полные батчи
+        atomicAdd(d_any_left, 1u); 
     }
 
     WARP_FLUSH_HASHES();
@@ -332,6 +326,7 @@ __global__ void kernel_point_add_and_check_sliced(
     #undef WARP_FLUSH_HASHES
     #undef FLUSH_THRESHOLD
 }
+
 
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
@@ -342,10 +337,12 @@ extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
 int main(int argc, char** argv) {
+    std::signal(SIGINT, handle_sigint);
+
     std::string target_hash_hex, range_hex, address_b58;
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
-    uint32_t slices_per_launch         = 64; // дефолт
+    uint32_t slices_per_launch         = 64; 
 
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
@@ -475,14 +472,12 @@ int main(int argc, char** argv) {
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
     if (threadsPerBlock < 32) threadsPerBlock=32;
 
-    // Память и выбор threadsTotal
-    const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t);
+    const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t); 
     size_t totalGlobalMem = prop.totalGlobalMem;
     const uint64_t reserveBytes = 64ull * 1024 * 1024;
     uint64_t usableMem = (totalGlobalMem > reserveBytes) ? (totalGlobalMem - reserveBytes) : (totalGlobalMem / 2);
     uint64_t maxThreadsByMem = usableMem / bytesPerThread;
 
-    // Требуем кратность B
     uint64_t q_div_batch[4], r_div_batch = 0ull;
     divmod_256_by_u64(range_len, (uint64_t)runtime_points_batch_size, q_div_batch, r_div_batch);
     if (r_div_batch != 0ull) {
@@ -518,7 +513,6 @@ int main(int argc, char** argv) {
     }
     int blocks = (int)(threadsTotal / (uint64_t)threadsPerBlock);
 
-    // Ключей на поток (кратно B)
     uint64_t per_thread_cnt[4]; uint64_t r_u64 = 0ull;
     divmod_256_by_u64(range_len, threadsTotal, per_thread_cnt, r_u64);
     if (r_u64 != 0ull) { std::cerr << "Internal error: range_len not divisible by threadsTotal.\n"; return EXIT_FAILURE; }
@@ -527,7 +521,6 @@ int main(int argc, char** argv) {
         if (rr != 0ull) { std::cerr << "Internal error: per-thread count is not a multiple of batch size.\n"; return EXIT_FAILURE; }
     }
 
-    // Хост-буферы
     uint64_t* h_counts256     = new uint64_t[threadsTotal * 4];
     uint64_t* h_start_scalars = new uint64_t[threadsTotal * 4];
 
@@ -538,7 +531,6 @@ int main(int argc, char** argv) {
         h_counts256[i*4+3] = per_thread_cnt[3];
     }
 
-    // Центр первого батча = start + half
     const uint32_t B = runtime_points_batch_size;
     const uint32_t half = B >> 1;
     {
@@ -555,7 +547,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Таргет в constant
     {
         uint32_t prefix_le = (uint32_t)target_hash160[0]
                            | ((uint32_t)target_hash160[1] << 8)
@@ -565,7 +556,6 @@ int main(int argc, char** argv) {
         cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     }
 
-    // Device buffers
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
     int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
     unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
@@ -587,14 +577,12 @@ int main(int argc, char** argv) {
       cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice);
       cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice); }
 
-    // Предвычислить P(S) — центры
     {
         int blocks_scal = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
         cudaDeviceSynchronize();
     }
 
-    // Предвычислить pG[1..B] в глобальные d_pGx/d_pGy (и держать их до конца)
     uint64_t *d_pGx=nullptr, *d_pGy=nullptr;
     {
         cudaMalloc(&d_pGx, (size_t)B * 4 * sizeof(uint64_t));
@@ -631,12 +619,11 @@ int main(int argc, char** argv) {
               << human_bytes((double)usedB) << " / " << human_bytes((double)totalB) << ")\n";
     std::cout << "------------------------------------------------------- \n";
     std::cout << std::left << std::setw(20) << "Total threads"     << " : " << (uint64_t)threadsTotal << "\n\n";
-    std::cout << "======== Phase-1: BruteForce (sliced) =================\n";
+    std::cout << "======== Phase-1: BruteForce ==========================\n";
 
     cudaStream_t streamKernel;
     cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking);
 
-    // Предпочесть shared и увеличить carveout (если поддерживается)
     cudaFuncSetCacheConfig(kernel_point_add_and_check_sliced, cudaFuncCachePreferShared);
     (void)cudaFuncSetAttribute(kernel_point_add_and_check_sliced,
                                cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -646,11 +633,15 @@ int main(int argc, char** argv) {
     auto tLast = t0;
     unsigned long long lastHashes = 0ull;
 
-    // Динамический shared для pGx+pGy
     size_t sharedBytes = (size_t)B * 4 * sizeof(uint64_t) * 2;
 
     bool stop_all = false;
+    bool completed_all = false; 
     while (!stop_all) {
+        if (g_sigint) {
+            std::cerr << "\n[Ctrl+C] Interrupt received. Finishing current kernel slice and exiting...\n";
+        }
+
         unsigned int zeroU = 0u;
         cudaMemcpyAsync(d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, streamKernel);
 
@@ -687,6 +678,9 @@ int main(int argc, char** argv) {
                 lastHashes = h_hashes; tLast = now;
             }
 
+            if (g_sigint) {
+            }
+
             int host_found = 0;
             cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
             if (host_found == FOUND_READY) { stop_all = true; break; }
@@ -695,12 +689,15 @@ int main(int argc, char** argv) {
             if (qs == cudaSuccess) break;
             else if (qs != cudaErrorNotReady) { cudaGetLastError(); stop_all = true; break; }
 
+            if (g_sigint) {
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
-    cudaStreamSynchronize(streamKernel);
+        cudaStreamSynchronize(streamKernel);
         std::cout.flush();
-        if (stop_all) break;
+        if (stop_all || g_sigint) break;
 
         unsigned int h_any = 0u;
         cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost);
@@ -708,7 +705,7 @@ int main(int argc, char** argv) {
         std::swap(d_Px, d_Rx);
         std::swap(d_Py, d_Ry);
 
-        if (h_any == 0u) break;
+        if (h_any == 0u) { completed_all = true; break; }
     }
 
     cudaDeviceSynchronize();
@@ -716,12 +713,26 @@ int main(int argc, char** argv) {
 
     int h_found_flag = 0;
     cudaMemcpy(&h_found_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
+
+    int exit_code = EXIT_SUCCESS;
+
     if (h_found_flag == FOUND_READY) {
         FoundResult host_result{};
         cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost);
         std::cout << "\n======== FOUND MATCH! =================================\n";
         std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
         std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
+    } else {
+        if (g_sigint) {
+            std::cout << "======== INTERRUPTED (Ctrl+C) ==========================\n";
+            std::cout << "Search was interrupted by user. Partial progress above.\n";
+            exit_code = 130; 
+        } else if (completed_all) {
+            std::cout << "======== KEY NOT FOUND (exhaustive) ===================\n";
+            std::cout << "Target hash160 was not found within the specified range.\n";
+        } else {
+            std::cout << "======== TERMINATED ===================================\n";
+        }
     }
 
     cudaFree(d_start_scalars); cudaFree(d_Px); cudaFree(d_Py); cudaFree(d_Rx); cudaFree(d_Ry);
@@ -730,6 +741,6 @@ int main(int argc, char** argv) {
     if (d_pGy) cudaFree(d_pGy);
     cudaStreamDestroy(streamKernel);
     delete[] h_start_scalars; delete[] h_counts256;
-    return 0;
-}
 
+    return exit_code;
+}
