@@ -22,7 +22,7 @@ I fixed this problem, to make sure that keys are not skipped I wrote a small scr
 The script is called **proof.py**. The script generates random scalars in a given range, calculates addresses, then runs Cyclone and at the end of the work shows how many keys were found and how many were not found. All should be found.
 Usage
 ```
-usage: proof.py [-h] --range RANGE_ARG [--cyclone-path CYCLONE_PATH] [--grid GRID_ARG] [--keys KEYS] [--tests TESTS] [--timeout TIMEOUT]
+sage: proof.py [-h] --range RANGE_ARG [--cyclone-path CYCLONE_PATH] [--grid GRID_ARG] [--batch BATCH] [--timeout TIMEOUT] [--start-count START_COUNT] [--end-count END_COUNT] [--quartile-count QUARTILE_COUNT]
 ```
 Sample start
 ```
