@@ -44,6 +44,22 @@ Random Q4 (75–100%)                : total=  20  success=  20  fail=   0
 Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
 ```
 
+After speed upgrade on RTX 4060 - tests
+```
+================ Summary by blocks ================
+Range start A (start+2k)           : total= 128  success= 128  fail=   0
+Range start B (start+1+2k)         : total= 128  success= 128  fail=   0
+Range end A (end-2k)               : total= 128  success= 128  fail=   0
+Range end B (end-1-2k)             : total= 128  success= 128  fail=   0
+Full mod 512 residue coverage      : total= 256  success= 256  fail=   0
+Random Q1 (0–25%)                  : total=  20  success=  20  fail=   0
+Random Q2 (25–50%)                 : total=  20  success=  20  fail=   0
+Random Q3 (50–75%)                 : total=  20  success=  20  fail=   0
+Random Q4 (75–100%)                : total=  20  success=  20  fail=   0
+
+Done. Results in cyclone_tests_results.txt. Successes=848 Failures=0
+
+```
 ## 🚀 Key Features
 
 - **GPU Acceleration**: Optimized for NVIDIA GPUs with full CUDA support.
