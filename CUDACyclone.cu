@@ -1,3 +1,4 @@
+
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cstdint>
@@ -11,7 +12,7 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
-#include <csignal>  
+#include <csignal>
 #include <atomic>
 
 #include "CUDAMath.h"
@@ -43,19 +44,22 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 #define WARP_SIZE 32
 #endif
 
+__constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
+__constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
+__constant__ uint64_t c_Jx[4];
+__constant__ uint64_t c_Jy[4];
+
 __launch_bounds__(256, 2)
-__global__ void kernel_point_add_and_check_sliced(
-    const uint64_t* __restrict__ Px,          
+__global__ void kernel_point_add_and_check_oneinv(
+    const uint64_t* __restrict__ Px,
     const uint64_t* __restrict__ Py,
-    uint64_t* __restrict__ Rx,               
+    uint64_t* __restrict__ Rx,
     uint64_t* __restrict__ Ry,
-    uint64_t* __restrict__ start_scalars,      
-    uint64_t* __restrict__ counts256,         
-    const uint64_t* __restrict__ pGx,       
-    const uint64_t* __restrict__ pGy,         
+    uint64_t* __restrict__ start_scalars,
+    uint64_t* __restrict__ counts256,
     uint64_t threadsTotal,
-    uint32_t batch_size,                     
-    uint32_t max_batches_per_launch,         
+    uint32_t batch_size,
+    uint32_t max_batches_per_launch,
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
     unsigned long long* __restrict__ hashes_accum,
@@ -65,16 +69,6 @@ __global__ void kernel_point_add_and_check_sliced(
     const int B = (int)batch_size;
     if (B <= 0 || (B & 1) || B > MAX_BATCH_SIZE) return;
     const int half = B >> 1;
-
-    extern __shared__ uint64_t s_mem[];
-    uint64_t* s_pGx = s_mem;
-    uint64_t* s_pGy = s_pGx + (size_t)B * 4;
-    const int total_limbs = B * 4;
-    for (int idx = threadIdx.x; idx < total_limbs; idx += blockDim.x) {
-        s_pGx[idx] = pGx[idx];
-        s_pGy[idx] = pGy[idx];
-    }
-    __syncthreads();
 
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
@@ -86,23 +80,21 @@ __global__ void kernel_point_add_and_check_sliced(
     const uint32_t target_prefix = c_target_prefix;
 
     unsigned int local_hashes = 0;
-    #define FLUSH_THRESHOLD 16384u
-    #define WARP_FLUSH_HASHES()                                                              \
-        do {                                                                                 \
-            unsigned long long v = warp_reduce_add_ull((unsigned long long)local_hashes);    \
-            if (lane == 0 && v) atomicAdd(hashes_accum, v);                                  \
-            local_hashes = 0;                                                                \
-        } while (0)
-    #define MAYBE_WARP_FLUSH()                                                               \
-        do { if ((local_hashes & (FLUSH_THRESHOLD - 1u)) == 0u) WARP_FLUSH_HASHES(); } while (0)
+    #define FLUSH_THRESHOLD 65536u
+    #define WARP_FLUSH_HASHES() do { \
+        unsigned long long v = warp_reduce_add_ull((unsigned long long)local_hashes); \
+        if (lane == 0 && v) atomicAdd(hashes_accum, v); \
+        local_hashes = 0; \
+    } while (0)
+    #define MAYBE_WARP_FLUSH() do { if ((local_hashes & (FLUSH_THRESHOLD - 1u)) == 0u) WARP_FLUSH_HASHES(); } while (0)
 
-    uint64_t Xc[4], Yc[4], S[4];
+    uint64_t x1[4], y1[4], S[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint64_t idx = gid * 4 + i;
-        Xc[i] = Px[idx];
-        Yc[i] = Py[idx];
-        S[i]  = start_scalars[idx];
+        x1[i] = Px[idx];
+        y1[i] = Py[idx];
+        S[i]  = start_scalars[idx];   
     }
     uint64_t rem[4];
 #pragma unroll
@@ -110,7 +102,7 @@ __global__ void kernel_point_add_and_check_sliced(
 
     if ((rem[0]|rem[1]|rem[2]|rem[3]) == 0ull) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { Rx[gid*4+i] = Xc[i]; Ry[gid*4+i] = Yc[i]; }
+        for (int i = 0; i < 4; ++i) { Rx[gid*4+i] = x1[i]; Ry[gid*4+i] = y1[i]; }
         WARP_FLUSH_HASHES(); return;
     }
 
@@ -121,8 +113,8 @@ __global__ void kernel_point_add_and_check_sliced(
 
         {
             uint8_t h20[20];
-            uint8_t prefix = (uint8_t)(Yc[0] & 1ULL) ? 0x03 : 0x02;
-            getHash160_33_from_limbs(prefix, Xc, h20);
+            uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
+            getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
             bool pref = hash160_prefix_equals(h20, target_prefix);
@@ -134,9 +126,9 @@ __global__ void kernel_point_add_and_check_sliced(
 #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=Xc[k];
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=Yc[k];
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
                         __threadfence_system();
                         atomicExch(d_found_flag, FOUND_READY);
                     }
@@ -149,77 +141,77 @@ __global__ void kernel_point_add_and_check_sliced(
         uint64_t acc[4], tmp[4];
 
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] = s_pGx[(size_t)(B - 1) * 4 + j];
-        ModSub256(acc, acc, Xc);
+        for (int j=0;j<4;++j) acc[j] = c_Jx[j];
+        ModSub256(acc, acc, x1);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) subp[half - 1][j] = acc[j];
+        for (int j=0;j<4;++j) subp[half-1][j] = acc[j];
 
         for (int i = half - 2; i >= 0; --i) {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) tmp[j] = s_pGx[(size_t)(i + 1) * 4 + j];
-            ModSub256(tmp, tmp, Xc);
+            for (int j=0;j<4;++j) tmp[j] = c_Gx[(size_t)(i+1)*4 + j];
+            ModSub256(tmp, tmp, x1);
             _ModMult(acc, acc, tmp);
 #pragma unroll
-            for (int j = 0; j < 4; ++j) subp[i][j] = acc[j];
+            for (int j=0;j<4;++j) subp[i][j] = acc[j];
         }
 
-        uint64_t d0[4];
+        uint64_t d0[4], inverse[5];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) d0[j] = s_pGx[0 * 4 + j];
-        ModSub256(d0, d0, Xc);
-
-        uint64_t inverse[5];
+        for (int j=0;j<4;++j) d0[j] = c_Gx[0*4 + j];
+        ModSub256(d0, d0, x1);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) inverse[j] = d0[j];
-        _ModMult(inverse, subp[0]);  // inverse = Π dx[1..half]
-        inverse[4] = 0ULL;
+        for (int j=0;j<4;++j) inverse[j] = d0[j];
+        _ModMult(inverse, subp[0]);
+        inverse[4] = 0ull;
         _ModInv(inverse);
 
+        uint64_t sy_neg[4], sx_neg[4];
+        ModNeg256(sy_neg, y1);
+        ModNeg256(sx_neg, x1);
 
-        for (int i = 0; i < half; ++i) {
+        for (int i = 0; i < half - 1; ++i) {
+            if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
+
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            if (i < (half - 1)) {
+            {
+                uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
 #pragma unroll
-                for (int j = 0; j < 4; ++j) { px_i[j] = s_pGx[(size_t)i*4 + j]; py_i[j] = s_pGy[(size_t)i*4 + j]; }
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
 
-                uint64_t dy[4], lam[4], x3[4], s[4];
-                ModSub256(dy, py_i, Yc);
-                _ModMult(lam, dy, dx_inv_i);
-                _ModSqr(x3, lam);
-                ModSub256(x3, x3, Xc);
-                ModSub256(x3, x3, px_i);
-                ModSub256(s, Xc, x3);
+                ModSub256(s, py_i, y1);
+                _ModMult(lam, s, dx_inv_i);
+
+                _ModSqr(px3, lam);     
+                ModSub256(px3, px3, x1);
+                ModSub256(px3, px3, px_i);
+
+                ModSub256(s, x1, px3); 
                 _ModMult(s, s, lam);
-                uint8_t odd; ModSub256isOdd(s, Yc, &odd);
+                uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, x3, h20);
+                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
                 bool pref = hash160_prefix_equals(h20, target_prefix);
                 if (__any_sync(full_mask, pref)) {
                     if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-
-                            uint64_t fs[4];
-#pragma unroll
-                            for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                             uint64_t addv=(uint64_t)(i+1);
-#pragma unroll
                             for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
 #pragma unroll
                             for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=x3[k];
-
-                            uint64_t y3_full[4]; ModSub256(y3_full, s, Yc);
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                           
+                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3_full[k];
-
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid;
+                            d_found_result->iter     = 0;
                             __threadfence_system();
                             atomicExch(d_found_flag, FOUND_READY);
                         }
@@ -229,46 +221,42 @@ __global__ void kernel_point_add_and_check_sliced(
             }
 
             {
-                uint64_t pxn[4], pyn[4];
+                uint64_t px3[4], s[4], lam[4];
+                uint64_t px_i[4], py_i[4];
 #pragma unroll
-                for (int j=0;j<4;++j){ pxn[j]=s_pGx[(size_t)i*4 + j]; pyn[j]=s_pGy[(size_t)i*4 + j]; }
-                ModNeg256(pyn, pyn);
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+                ModNeg256(py_i, py_i); 
 
-                uint64_t dy[4], lam[4], x3[4], s[4];
-                ModSub256(dy, pyn, Yc);
-                _ModMult(lam, dy, dx_inv_i);
-                _ModSqr(x3, lam);
-                ModSub256(x3, x3, Xc);
-                ModSub256(x3, x3, pxn);
-                ModSub256(s, Xc, x3);
+                ModSub256(s, py_i, y1);
+                _ModMult(lam, s, dx_inv_i);
+
+                _ModSqr(px3, lam);
+                ModSub256(px3, px3, x1);
+                ModSub256(px3, px3, px_i);
+
+                ModSub256(s, x1, px3);
                 _ModMult(s, s, lam);
-                uint8_t odd; ModSub256isOdd(s, Yc, &odd);
+                uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, x3, h20);
+                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
                 bool pref = hash160_prefix_equals(h20, target_prefix);
                 if (__any_sync(full_mask, pref)) {
                     if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-
-                            uint64_t fs[4];
-#pragma unroll
-                            for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
                             uint64_t sub=(uint64_t)(i+1);
-#pragma unroll
                             for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 #pragma unroll
                             for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=x3[k];
-
-                            uint64_t y3_full[4]; ModSub256(y3_full, s, Yc);
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3_full[k];
-
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid;
+                            d_found_result->iter     = 0;
                             __threadfence_system();
                             atomicExch(d_found_flag, FOUND_READY);
                         }
@@ -277,29 +265,88 @@ __global__ void kernel_point_add_and_check_sliced(
                 }
             }
 
+            uint64_t gxmi[4];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) tmp[j] = s_pGx[(size_t)i*4 + j];
-            ModSub256(tmp, tmp, Xc);
-            _ModMult(inverse, tmp);
+            for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
+            ModSub256(gxmi, gxmi, x1);
+            _ModMult(inverse, inverse, gxmi);
         }
 
         {
-            uint64_t Jx[4], Jy[4];
+            const int i = half - 1;
+            uint64_t dx_inv_i[4];
+            _ModMult(dx_inv_i, subp[i], inverse);
+
+            uint64_t px3[4], s[4], lam[4];
+            uint64_t px_i[4], py_i[4];
 #pragma unroll
-            for (int j=0;j<4;++j) { Jx[j]=s_pGx[(size_t)(B-1)*4 + j]; Jy[j]=s_pGy[(size_t)(B-1)*4 + j]; }
-            uint64_t dxJ[4], dyJ[4], lamJ[4], xJ[4], sJ[4];
-            ModSub256(dxJ, Jx, Xc);
-            uint64_t invJ[5]; for (int j=0;j<4;++j) invJ[j]=dxJ[j]; invJ[4]=0ull; _ModInv(invJ);
-            ModSub256(dyJ, Jy, Yc);
-            _ModMult(lamJ, dyJ, invJ);
-            _ModSqr(xJ, lamJ);
-            ModSub256(xJ, xJ, Xc);
-            ModSub256(xJ, xJ, Jx);
-            ModSub256(sJ, Xc, xJ);
-            _ModMult(sJ, sJ, lamJ);
-            ModSub256(sJ, sJ, Yc);
+            for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+            ModNeg256(py_i, py_i);
+
+            ModSub256(s, py_i, y1);
+            _ModMult(lam, s, dx_inv_i);
+
+            _ModSqr(px3, lam);
+            ModSub256(px3, px3, x1);
+            ModSub256(px3, px3, px_i);
+
+            ModSub256(s, x1, px3);
+            _ModMult(s, s, lam);
+            uint8_t odd; ModSub256isOdd(s, y1, &odd);
+
+            uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+            ++local_hashes; MAYBE_WARP_FLUSH();
+
+            bool pref = hash160_prefix_equals(h20, target_prefix);
+            if (__any_sync(full_mask, pref)) {
+                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                        uint64_t sub=(uint64_t)half;
+                        for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 #pragma unroll
-            for (int j=0;j<4;++j){ Xc[j]=xJ[j]; Yc[j]=sJ[j]; }
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+#pragma unroll
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                        d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
+                        __threadfence_system();
+                        atomicExch(d_found_flag, FOUND_READY);
+                    }
+                }
+                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
+            }
+
+            uint64_t last_dx[4];
+#pragma unroll
+            for (int j=0;j<4;++j) last_dx[j] = c_Gx[(size_t)i*4 + j];
+            ModSub256(last_dx, last_dx, x1);
+            _ModMult(inverse, inverse, last_dx);
+        }
+
+        {
+            uint64_t lam[4], s[4], x3[4], y3[4];
+
+            uint64_t Jy_minus_y1[4];
+#pragma unroll
+            for (int j=0;j<4;++j) Jy_minus_y1[j] = c_Jy[j];
+            ModSub256(Jy_minus_y1, Jy_minus_y1, y1);
+
+            _ModMult(lam, Jy_minus_y1, inverse);
+            _ModSqr(x3, lam);
+            ModSub256(x3, x3, x1);
+            uint64_t Jx_local[4]; for (int j=0;j<4;++j) Jx_local[j]=c_Jx[j];
+            ModSub256(x3, x3, Jx_local);
+
+            ModSub256(s, x1, x3);
+            _ModMult(y3, s, lam);
+            ModSub256(y3, y3, y1);
+
+#pragma unroll
+            for (int j=0;j<4;++j) { x1[j] = x3[j]; y1[j] = y3[j]; }
         }
 
         {
@@ -312,13 +359,13 @@ __global__ void kernel_point_add_and_check_sliced(
 
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        Rx[gid*4+i] = Xc[i];
-        Ry[gid*4+i] = Yc[i];
+        Rx[gid*4+i] = x1[i];
+        Ry[gid*4+i] = y1[i];
         counts256[gid*4+i] = rem[i];
         start_scalars[gid*4+i] = S[i];
     }
     if ((rem[0] | rem[1] | rem[2] | rem[3]) != 0ull) {
-        atomicAdd(d_any_left, 1u); 
+        atomicAdd(d_any_left, 1u);
     }
 
     WARP_FLUSH_HASHES();
@@ -326,7 +373,6 @@ __global__ void kernel_point_add_and_check_sliced(
     #undef WARP_FLUSH_HASHES
     #undef FLUSH_THRESHOLD
 }
-
 
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
@@ -342,7 +388,7 @@ int main(int argc, char** argv) {
     std::string target_hash_hex, range_hex, address_b58;
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
-    uint32_t slices_per_launch         = 64; 
+    uint32_t slices_per_launch         = 64;
 
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
@@ -468,11 +514,14 @@ int main(int argc, char** argv) {
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
         std::cerr<<"CUDA init error\n"; return EXIT_FAILURE;
     }
+
+    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+
     int threadsPerBlock=256;
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
     if (threadsPerBlock < 32) threadsPerBlock=32;
 
-    const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t); 
+    const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t);
     size_t totalGlobalMem = prop.totalGlobalMem;
     const uint64_t reserveBytes = 64ull * 1024 * 1024;
     uint64_t usableMem = (totalGlobalMem > reserveBytes) ? (totalGlobalMem - reserveBytes) : (totalGlobalMem / 2);
@@ -521,8 +570,10 @@ int main(int argc, char** argv) {
         if (rr != 0ull) { std::cerr << "Internal error: per-thread count is not a multiple of batch size.\n"; return EXIT_FAILURE; }
     }
 
-    uint64_t* h_counts256     = new uint64_t[threadsTotal * 4];
-    uint64_t* h_start_scalars = new uint64_t[threadsTotal * 4];
+    uint64_t* h_counts256     = nullptr;
+    uint64_t* h_start_scalars = nullptr;
+    cudaHostAlloc(&h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
+    cudaHostAlloc(&h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
 
     for (uint64_t i = 0; i < threadsTotal; ++i) {
         h_counts256[i*4+0] = per_thread_cnt[0];
@@ -536,7 +587,7 @@ int main(int argc, char** argv) {
     {
         uint64_t cur[4] = { range_start[0], range_start[1], range_start[2], range_start[3] };
         for (uint64_t i = 0; i < threadsTotal; ++i) {
-            uint64_t Sc[4]; add256_u64(cur, (uint64_t)half, Sc);
+            uint64_t Sc[4]; add256_u64(cur, (uint64_t)half, Sc); 
             h_start_scalars[i*4+0] = Sc[0];
             h_start_scalars[i*4+1] = Sc[1];
             h_start_scalars[i*4+2] = Sc[2];
@@ -560,46 +611,89 @@ int main(int argc, char** argv) {
     int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
     unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
 
-    cudaMalloc(&d_start_scalars, threadsTotal * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Px,           threadsTotal * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Py,           threadsTotal * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Rx,           threadsTotal * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Ry,           threadsTotal * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_counts256,    threadsTotal * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_found_flag,   sizeof(int));
-    cudaMalloc(&d_found_result, sizeof(FoundResult));
-    cudaMalloc(&d_hashes_accum, sizeof(unsigned long long));
-    cudaMalloc(&d_any_left,     sizeof(unsigned int));
+    auto ck = [](cudaError_t e, const char* msg){
+        if (e != cudaSuccess) {
+            std::cerr << msg << ": " << cudaGetErrorString(e) << "\n";
+            std::exit(EXIT_FAILURE);
+        }
+    };
 
-    cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_counts256,     h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    ck(cudaMalloc(&d_start_scalars, threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_start_scalars)");
+    ck(cudaMalloc(&d_Px,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Px)");
+    ck(cudaMalloc(&d_Py,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Py)");
+    ck(cudaMalloc(&d_Rx,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Rx)");
+    ck(cudaMalloc(&d_Ry,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Ry)");
+    ck(cudaMalloc(&d_counts256,    threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_counts256)");
+    ck(cudaMalloc(&d_found_flag,   sizeof(int)),                         "cudaMalloc(d_found_flag)");
+    ck(cudaMalloc(&d_found_result, sizeof(FoundResult)),                 "cudaMalloc(d_found_result)");
+    ck(cudaMalloc(&d_hashes_accum, sizeof(unsigned long long)),          "cudaMalloc(d_hashes_accum)");
+    ck(cudaMalloc(&d_any_left,     sizeof(unsigned int)),                "cudaMalloc(d_any_left)");
+
+    ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy start_scalars");
+    ck(cudaMemcpy(d_counts256,     h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy counts256");
     { int zero = FOUND_NONE; unsigned long long zero64=0ull;
-      cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice);
-      cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice); }
+      ck(cudaMemcpy(d_found_flag, &zero,   sizeof(int),                cudaMemcpyHostToDevice), "init found_flag");
+      ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum"); }
 
     {
         int blocks_scal = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
-        cudaDeviceSynchronize();
+        ck(cudaDeviceSynchronize(), "scalarMulKernelBase sync");
+        ck(cudaGetLastError(), "scalarMulKernelBase launch");
     }
 
-    uint64_t *d_pGx=nullptr, *d_pGy=nullptr;
     {
-        cudaMalloc(&d_pGx, (size_t)B * 4 * sizeof(uint64_t));
-        cudaMalloc(&d_pGy, (size_t)B * 4 * sizeof(uint64_t));
+        uint64_t* h_scalars_half = nullptr;
+        cudaHostAlloc(&h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
+        std::memset(h_scalars_half, 0, (size_t)half * 4 * sizeof(uint64_t));
+        for (uint32_t k = 0; k < half; ++k) h_scalars_half[(size_t)k*4 + 0] = (uint64_t)(k + 1);
 
-        uint64_t* h_scal = (uint64_t*)malloc((size_t)B * 4 * sizeof(uint64_t));
-        std::memset(h_scal, 0, (size_t)B * 4 * sizeof(uint64_t));
-        for (uint32_t k = 0; k < B; ++k) h_scal[(size_t)k*4 + 0] = (uint64_t)(k + 1);
+        uint64_t *d_scalars_half=nullptr, *d_Gx_half=nullptr, *d_Gy_half=nullptr;
+        ck(cudaMalloc(&d_scalars_half, (size_t)half * 4 * sizeof(uint64_t)), "cudaMalloc(d_scalars_half)");
+        ck(cudaMalloc(&d_Gx_half,      (size_t)half * 4 * sizeof(uint64_t)), "cudaMalloc(d_Gx_half)");
+        ck(cudaMalloc(&d_Gy_half,      (size_t)half * 4 * sizeof(uint64_t)), "cudaMalloc(d_Gy_half)");
+        ck(cudaMemcpy(d_scalars_half, h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy half scalars");
 
-        uint64_t *d_pG_scalars=nullptr; cudaMalloc(&d_pG_scalars, (size_t)B * 4 * sizeof(uint64_t));
-        cudaMemcpy(d_pG_scalars, h_scal, (size_t)B * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        int blocks_scal = (int)((half + threadsPerBlock - 1) / threadsPerBlock);
+        scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_scalars_half, d_Gx_half, d_Gy_half, (int)half);
+        ck(cudaDeviceSynchronize(), "scalarMulKernelBase(half) sync");
+        ck(cudaGetLastError(), "scalarMulKernelBase(half) launch");
 
-        int blocks_scal = (int)((B + threadsPerBlock - 1) / threadsPerBlock);
-        scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_pG_scalars, d_pGx, d_pGy, (int)B);
-        cudaDeviceSynchronize();
+        uint64_t* h_Gx_half = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
+        uint64_t* h_Gy_half = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
+        ck(cudaMemcpy(h_Gx_half, d_Gx_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Gx_half");
+        ck(cudaMemcpy(h_Gy_half, d_Gy_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Gy_half");
+        ck(cudaMemcpyToSymbol(c_Gx, h_Gx_half, (size_t)half * 4 * sizeof(uint64_t)), "ToSymbol c_Gx");
+        ck(cudaMemcpyToSymbol(c_Gy, h_Gy_half, (size_t)half * 4 * sizeof(uint64_t)), "ToSymbol c_Gy");
 
-        cudaFree(d_pG_scalars); free(h_scal);
+        cudaFree(d_scalars_half); cudaFree(d_Gx_half); cudaFree(d_Gy_half);
+        cudaFreeHost(h_scalars_half);
+        std::free(h_Gx_half); std::free(h_Gy_half);
+    }
+    {
+        uint64_t* h_scalarB = nullptr;
+        cudaHostAlloc(&h_scalarB, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
+        std::memset(h_scalarB, 0, 4 * sizeof(uint64_t));
+        h_scalarB[0] = (uint64_t)B;
+
+        uint64_t *d_scalarB=nullptr, *d_Jx=nullptr, *d_Jy=nullptr;
+        ck(cudaMalloc(&d_scalarB, 4 * sizeof(uint64_t)), "cudaMalloc(d_scalarB)");
+        ck(cudaMalloc(&d_Jx,      4 * sizeof(uint64_t)), "cudaMalloc(d_Jx)");
+        ck(cudaMalloc(&d_Jy,      4 * sizeof(uint64_t)), "cudaMalloc(d_Jy)");
+        ck(cudaMemcpy(d_scalarB, h_scalarB, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy scalarB");
+
+        scalarMulKernelBase<<<1, 1>>>(d_scalarB, d_Jx, d_Jy, 1);
+        ck(cudaDeviceSynchronize(), "scalarMulKernelBase(B) sync");
+        ck(cudaGetLastError(), "scalarMulKernelBase(B) launch");
+
+        uint64_t hJx[4], hJy[4];
+        ck(cudaMemcpy(hJx, d_Jx, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jx");
+        ck(cudaMemcpy(hJy, d_Jy, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jy");
+        ck(cudaMemcpyToSymbol(c_Jx, hJx, 4 * sizeof(uint64_t)), "ToSymbol c_Jx");
+        ck(cudaMemcpyToSymbol(c_Jy, hJy, 4 * sizeof(uint64_t)), "ToSymbol c_Jy");
+
+        cudaFree(d_scalarB); cudaFree(d_Jx); cudaFree(d_Jy);
+        cudaFreeHost(h_scalarB);
     }
 
     size_t freeB=0,totalB=0; cudaMemGetInfo(&freeB,&totalB);
@@ -610,7 +704,7 @@ int main(int argc, char** argv) {
     std::cout << std::left << std::setw(20) << "Device"            << " : " << prop.name << " (compute " << prop.major << "." << prop.minor << ")\n";
     std::cout << std::left << std::setw(20) << "SM"                << " : " << prop.multiProcessorCount << "\n";
     std::cout << std::left << std::setw(20) << "ThreadsPerBlock"   << " : " << threadsPerBlock << "\n";
-    std::cout << std::left << std::setw(20) << "Blocks"            << " : " << blocks << "\n";
+    std::cout << std::left << std::setw(20) << "Blocks"            << " : " << (int)(threadsTotal / (uint64_t)threadsPerBlock) << "\n";
     std::cout << std::left << std::setw(20) << "Points batch size" << " : " << B << "\n";
     std::cout << std::left << std::setw(20) << "Batches/SM"        << " : " << runtime_batches_per_sm << "\n";
     std::cout << std::left << std::setw(20) << "Batches/launch"    << " : " << slices_per_launch << " (per thread)\n";
@@ -622,33 +716,25 @@ int main(int argc, char** argv) {
     std::cout << "======== Phase-1: BruteForce ==========================\n";
 
     cudaStream_t streamKernel;
-    cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking);
+    ck(cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking), "create stream");
 
-    cudaFuncSetCacheConfig(kernel_point_add_and_check_sliced, cudaFuncCachePreferShared);
-    (void)cudaFuncSetAttribute(kernel_point_add_and_check_sliced,
-                               cudaFuncAttributePreferredSharedMemoryCarveout,
-                               cudaSharedmemCarveoutMaxShared);
+    (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv, cudaFuncCachePreferL1);
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
     unsigned long long lastHashes = 0ull;
 
-    size_t sharedBytes = (size_t)B * 4 * sizeof(uint64_t) * 2;
-
     bool stop_all = false;
-    bool completed_all = false; 
+    bool completed_all = false;
     while (!stop_all) {
-        if (g_sigint) {
-            std::cerr << "\n[Ctrl+C] Interrupt received. Finishing current kernel slice and exiting...\n";
-        }
+        if (g_sigint) std::cerr << "\n[Ctrl+C] Interrupt received. Finishing current kernel slice and exiting...\n";
 
         unsigned int zeroU = 0u;
-        cudaMemcpyAsync(d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, streamKernel);
+        ck(cudaMemcpyAsync(d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, streamKernel), "zero d_any_left");
 
-        kernel_point_add_and_check_sliced<<<blocks, threadsPerBlock, sharedBytes, streamKernel>>>(
+        kernel_point_add_and_check_oneinv<<<blocks, threadsPerBlock, 0, streamKernel>>>(
             d_Px, d_Py, d_Rx, d_Ry,
             d_start_scalars, d_counts256,
-            d_pGx, d_pGy,
             threadsTotal,
             B,
             slices_per_launch,
@@ -656,14 +742,18 @@ int main(int argc, char** argv) {
             d_hashes_accum,
             d_any_left
         );
-        cudaGetLastError();
+        cudaError_t launchErr = cudaGetLastError();
+        if (launchErr != cudaSuccess) {
+            std::cerr << "\nKernel launch error: " << cudaGetErrorString(launchErr) << "\n";
+            stop_all = true;
+        }
 
-        while (true) {
+        while (!stop_all) {
             auto now = std::chrono::high_resolution_clock::now();
             double dt = std::chrono::duration<double>(now - tLast).count();
             if (dt >= 1.0) {
                 unsigned long long h_hashes = 0ull;
-                cudaMemcpy(&h_hashes, d_hashes_accum, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+                ck(cudaMemcpy(&h_hashes, d_hashes_accum, sizeof(unsigned long long), cudaMemcpyDeviceToHost), "read hashes");
                 double delta = (double)(h_hashes - lastHashes);
                 double mkeys = delta / (dt * 1e6);
                 double elapsed = std::chrono::duration<double>(now - t0).count();
@@ -678,19 +768,13 @@ int main(int argc, char** argv) {
                 lastHashes = h_hashes; tLast = now;
             }
 
-            if (g_sigint) {
-            }
-
             int host_found = 0;
-            cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
+            ck(cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "read found_flag");
             if (host_found == FOUND_READY) { stop_all = true; break; }
 
             cudaError_t qs = cudaStreamQuery(streamKernel);
             if (qs == cudaSuccess) break;
             else if (qs != cudaErrorNotReady) { cudaGetLastError(); stop_all = true; break; }
-
-            if (g_sigint) {
-            }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -700,7 +784,7 @@ int main(int argc, char** argv) {
         if (stop_all || g_sigint) break;
 
         unsigned int h_any = 0u;
-        cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+        ck(cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read any_left");
 
         std::swap(d_Px, d_Rx);
         std::swap(d_Py, d_Ry);
@@ -712,13 +796,13 @@ int main(int argc, char** argv) {
     std::cout << "\n";
 
     int h_found_flag = 0;
-    cudaMemcpy(&h_found_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
+    ck(cudaMemcpy(&h_found_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "final read found_flag");
 
     int exit_code = EXIT_SUCCESS;
 
     if (h_found_flag == FOUND_READY) {
         FoundResult host_result{};
-        cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost);
+        ck(cudaMemcpy(&host_result, d_found_result, sizeof(FoundResult), cudaMemcpyDeviceToHost), "read found_result");
         std::cout << "\n======== FOUND MATCH! =================================\n";
         std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
         std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
@@ -726,7 +810,7 @@ int main(int argc, char** argv) {
         if (g_sigint) {
             std::cout << "======== INTERRUPTED (Ctrl+C) ==========================\n";
             std::cout << "Search was interrupted by user. Partial progress above.\n";
-            exit_code = 130; 
+            exit_code = 130;
         } else if (completed_all) {
             std::cout << "======== KEY NOT FOUND (exhaustive) ===================\n";
             std::cout << "Target hash160 was not found within the specified range.\n";
@@ -737,10 +821,10 @@ int main(int argc, char** argv) {
 
     cudaFree(d_start_scalars); cudaFree(d_Px); cudaFree(d_Py); cudaFree(d_Rx); cudaFree(d_Ry);
     cudaFree(d_counts256); cudaFree(d_found_flag); cudaFree(d_found_result); cudaFree(d_hashes_accum); cudaFree(d_any_left);
-    if (d_pGx) cudaFree(d_pGx);
-    if (d_pGy) cudaFree(d_pGy);
     cudaStreamDestroy(streamKernel);
-    delete[] h_start_scalars; delete[] h_counts256;
+
+    if (h_start_scalars) cudaFreeHost(h_start_scalars);
+    if (h_counts256)     cudaFreeHost(h_counts256);
 
     return exit_code;
 }
