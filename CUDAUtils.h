@@ -1,55 +1,63 @@
+#if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
+#include <intrin.h>
+#endif
+
 __host__ __forceinline__ void add256_u64(const uint64_t a[4], uint64_t b, uint64_t out[4]) {
-    __uint128_t sum = (__uint128_t)a[0] + b;
-    out[0] = (uint64_t)sum;
-    uint64_t carry = (uint64_t)(sum >> 64);
+    out[0] = a[0] + b;
+    uint64_t carry = (out[0] < a[0]) ? 1ULL : 0ULL;
     for (int i = 1; i < 4; ++i) {
-        sum = (__uint128_t)a[i] + carry;
-        out[i] = (uint64_t)sum;
-        carry = (uint64_t)(sum >> 64);
+        out[i] = a[i] + carry;
+        carry = (out[i] < a[i]) ? 1ULL : 0ULL;
     }
 }
 
 __host__ __forceinline__ void add256(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
-    __uint128_t carry = 0;
+    uint64_t carry = 0;
     for (int i = 0; i < 4; ++i) {
-        __uint128_t s = (__uint128_t)a[i] + b[i] + carry;
-        out[i] = (uint64_t)s;
-        carry = s >> 64;
+        uint64_t s = a[i] + b[i];
+        uint64_t c = (s < a[i]) ? 1ULL : 0ULL;
+        uint64_t s2 = s + carry;
+        if (s2 < s) c = 1ULL;
+        out[i] = s2;
+        carry = c;
     }
 }
 
 __host__ __forceinline__ void sub256(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
     uint64_t borrow = 0;
     for (int i = 0; i < 4; ++i) {
-        uint64_t bi = b[i] + borrow;
-        if (a[i] < bi) {
-            out[i] = (uint64_t)(((__uint128_t(1) << 64) + a[i]) - bi);
-            borrow = 1;
-        } else {
-            out[i] = a[i] - bi;
-            borrow = 0;
-        }
+        uint64_t diff = a[i] - borrow;
+        uint64_t nb = (diff > a[i]) ? 1ULL : 0ULL;
+        uint64_t diff2 = diff - b[i];
+        if (diff2 > diff) nb = 1ULL;
+        out[i] = diff2;
+        borrow = nb;
     }
 }
 
 __host__ __forceinline__ void inc256(uint64_t a[4], uint64_t inc) {
-    __uint128_t cur = (__uint128_t)a[0] + inc;
-    a[0] = (uint64_t)cur;
-    uint64_t carry = (uint64_t)(cur >> 64);
+    a[0] += inc;
+    uint64_t carry = (a[0] < inc) ? 1ULL : 0ULL;
     for (int i = 1; i < 4 && carry; ++i) {
-        cur = (__uint128_t)a[i] + carry;
-        a[i] = (uint64_t)cur;
-        carry = (uint64_t)(cur >> 64);
+        ++a[i];
+        carry = (a[i] == 0ULL) ? 1ULL : 0ULL;
     }
 }
 
 __host__ void divmod_256_by_u64(const uint64_t value[4], uint64_t divisor, uint64_t quotient[4], uint64_t &remainder) {
+#ifdef _MSC_VER
+    remainder = 0;
+    for (int i = 3; i >= 0; --i) {
+        quotient[i] = _udiv128(remainder, value[i], divisor, &remainder);
+    }
+#else
     remainder = 0;
     for (int i = 3; i >= 0; --i) {
         __uint128_t cur = (__uint128_t(remainder) << 64) | value[i];
         quotient[i] = (uint64_t)(cur / divisor);
         remainder = (uint64_t)(cur % divisor);
     }
+#endif
 }
 
 bool hexToLE64(const std::string& h_in, uint64_t w[4]) {
@@ -82,13 +90,12 @@ std::string formatHex256(const uint64_t limbs[4]) {
 }
 
 __device__ __forceinline__ void inc256_device(uint64_t a[4], uint64_t inc) {
-    unsigned __int128 cur = (unsigned __int128)a[0] + inc;
-    a[0] = (uint64_t)cur;
-    uint64_t carry = (uint64_t)(cur >> 64);
+    uint64_t sum = a[0] + inc;
+    a[0] = sum;
+    uint64_t carry = (sum < inc) ? 1ULL : 0ULL;
     for (int i = 1; i < 4 && carry; ++i) {
-        cur = (unsigned __int128)a[i] + carry;
-        a[i] = (uint64_t)cur;
-        carry = (uint64_t)(cur >> 64);
+        ++a[i];
+        carry = (a[i] == 0ULL) ? 1ULL : 0ULL;
     }
 }
 

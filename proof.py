@@ -7,7 +7,6 @@ import time
 import sys
 import math
 import random
-import select
 from typing import List, Tuple, Optional, Set, Dict
 from ecdsa import SECP256k1, SigningKey
 
@@ -107,14 +106,21 @@ def run_cyclone_and_watch(
         assert p.stdout is not None
         for line in p.stdout:
             if match_marker in line:
-                for _ in range(20):
-                    fd = p.stdout.fileno()
-                    rlist, _, _ = select.select([fd], [], [], 0.2)
-                    if not rlist:
-                        break
-                    nxt = p.stdout.readline()
-                    if not nxt:
-                        break
+                import threading
+                result_lines = []
+                def read_remaining():
+                    for _ in range(20):
+                        try:
+                            nxt = p.stdout.readline()
+                            if not nxt:
+                                break
+                            result_lines.append(nxt)
+                        except Exception:
+                            break
+                reader = threading.Thread(target=read_remaining, daemon=True)
+                reader.start()
+                reader.join(timeout=1.0)
+                for nxt in result_lines:
                     if "Private Key" in nxt:
                         parts = nxt.split(":", 1)
                         if len(parts) > 1:

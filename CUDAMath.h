@@ -1,7 +1,6 @@
 #define NBBLOCK 5
 #define BIFULLSIZE 40
 
-
 #define UADDO(c, a, b) asm volatile ("add.cc.u64 %0, %1, %2;" : "=l"(c) : "l"(a), "l"(b) : "memory" );
 #define UADDC(c, a, b) asm volatile ("addc.cc.u64 %0, %1, %2;" : "=l"(c) : "l"(a), "l"(b) : "memory" );
 #define UADD(c, a, b) asm volatile ("addc.u64 %0, %1, %2;" : "=l"(c) : "l"(a), "l"(b));
@@ -979,79 +978,58 @@ __device__ __forceinline__ bool fieldIsZero(const uint64_t a[4]) {
 }
 
 __device__ void fieldAdd(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
-    __uint128_t t = 0;
-    uint64_t c = 0;
+    uint64_t carry = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        uint64_t s = a[i] + b[i];
+        uint64_t c = (s < a[i]) ? 1ULL : 0ULL;
+        s += carry;
+        if (s < carry) c = 1ULL;
+        out[i] = s;
+        carry = c;
+    }
 
-    t = (__uint128_t)a[0] + b[0];
-    out[0] = (uint64_t)t;
-    c = (uint64_t)(t >> 64);
-
-    t = (__uint128_t)a[1] + b[1] + c;
-    out[1] = (uint64_t)t;
-    c = (uint64_t)(t >> 64);
-
-    t = (__uint128_t)a[2] + b[2] + c;
-    out[2] = (uint64_t)t;
-    c = (uint64_t)(t >> 64);
-
-    t = (__uint128_t)a[3] + b[3] + c;
-    out[3] = (uint64_t)t;
-    c = (uint64_t)(t >> 64); 
-
-    if (c || (out[3] > SECP_P_LE[3]) || 
+    if (carry || (out[3] > SECP_P_LE[3]) || 
         (out[3] == SECP_P_LE[3] && out[2] > SECP_P_LE[2]) || 
         (out[3] == SECP_P_LE[3] && out[2] == SECP_P_LE[2] && out[1] > SECP_P_LE[1]) || 
         (out[3] == SECP_P_LE[3] && out[2] == SECP_P_LE[2] && out[1] == SECP_P_LE[1] && out[0] >= SECP_P_LE[0])) {
 
-        __uint128_t tb;
         uint64_t borrow = 0;
-        tb = (__uint128_t)out[0] - SECP_P_LE[0];
-        out[0] = (uint64_t)tb;
-        borrow = (tb > 0xFFFFFFFFFFFFFFFFULL) ? 1 : 0;
-
-        tb = (__uint128_t)out[1] - SECP_P_LE[1] - borrow;
-        out[1] = (uint64_t)tb;
-        borrow = (tb > 0xFFFFFFFFFFFFFFFFULL) ? 1 : 0;
-
-        tb = (__uint128_t)out[2] - SECP_P_LE[2] - borrow;
-        out[2] = (uint64_t)tb;
-        borrow = (tb > 0xFFFFFFFFFFFFFFFFULL) ? 1 : 0;
-
-        tb = (__uint128_t)out[3] - SECP_P_LE[3] - borrow;
-        out[3] = (uint64_t)tb;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint64_t diff = out[i] - borrow;
+            uint64_t nb = (diff > out[i]) ? 1ULL : 0ULL;
+            uint64_t diff2 = diff - SECP_P_LE[i];
+            if (diff2 > diff) nb = 1ULL;
+            out[i] = diff2;
+            borrow = nb;
+        }
     }
 }
 
 __device__ void fieldSub(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
-    __int128_t t;
     uint64_t borrow = 0;
-
-    t = (__int128_t)a[0] - b[0];
-    out[0] = (uint64_t)t; borrow = (t < 0);
-
-    t = (__int128_t)a[1] - b[1] - borrow;
-    out[1] = (uint64_t)t; borrow = (t < 0);
-
-    t = (__int128_t)a[2] - b[2] - borrow;
-    out[2] = (uint64_t)t; borrow = (t < 0);
-
-    t = (__int128_t)a[3] - b[3] - borrow;
-    out[3] = (uint64_t)t; borrow = (t < 0);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        uint64_t diff = a[i] - borrow;
+        uint64_t nb = (diff > a[i]) ? 1ULL : 0ULL;
+        uint64_t diff2 = diff - b[i];
+        if (diff2 > diff) nb = 1ULL;
+        out[i] = diff2;
+        borrow = nb;
+    }
 
     if (borrow) {
-        __uint128_t tu;
         uint64_t carry = 0;
-        tu = (__uint128_t)out[0] + SECP_P_LE[0];
-        out[0] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
-
-        tu = (__uint128_t)out[1] + SECP_P_LE[1] + carry;
-        out[1] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
-
-        tu = (__uint128_t)out[2] + SECP_P_LE[2] + carry;
-        out[2] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
-
-        tu = (__uint128_t)out[3] + SECP_P_LE[3] + carry;
-        out[3] = (uint64_t)tu;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint64_t s = out[i] + SECP_P_LE[i];
+            uint64_t c = (s < out[i]) ? 1ULL : 0ULL;
+            s += carry;
+            if (s < carry) c = 1ULL;
+            out[i] = s;
+            carry = c;
+        }
     }
 }
 

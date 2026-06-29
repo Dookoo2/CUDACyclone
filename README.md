@@ -22,7 +22,7 @@ I fixed this problem, to make sure that keys are not skipped I wrote a small scr
 The script is called **proof.py**. The script generates random scalars in a given range, calculates addresses, then runs Cyclone and at the end of the work shows how many keys were found and how many were not found. All should be found.
 Usage
 ```
-sage: proof.py [-h] --range RANGE_ARG [--cyclone-path CYCLONE_PATH] [--grid GRID_ARG] [--batch BATCH] [--timeout TIMEOUT] [--start-count START_COUNT] [--end-count END_COUNT] [--quartile-count QUARTILE_COUNT]
+usage: proof.py [-h] --range RANGE_ARG [--cyclone-path CYCLONE_PATH] [--grid GRID_ARG] [--batch BATCH] [--timeout TIMEOUT] [--start-count START_COUNT] [--end-count END_COUNT] [--quartile-count QUARTILE_COUNT]
 ```
 Sample start
 ```
@@ -92,6 +92,7 @@ Users have reported the following speeds:
 | RTX 4070 Ti Super | 512,1024  | 3170 Mkeys/s    | Community report       |
 | L4-2Q             | 512,256   | 1360 Mkeys/s    | Community report       |
 | RTX3070 mobile    | 256,256   | 1150 Mkeys/s    | Community report       |
+| RTX 3060          | 64,64     | 550 Mkeys/s     | Tested on Windows      |
 
 ---
 
@@ -184,22 +185,35 @@ Time: 61.2 s | Speed: 1234.3 Mkeys/s | Count: 72707573152 | Progress: 52.90 %
 Private Key   : 00000000000000000000000000000000000000000000000000000022382FACD0
 Public Key    : 03C060E1E3771CBECCB38E119C2414702F3F5181A89652538851D2E3886BDD70C6
 ```
-## 🛠️ Getting Started
-To get started with CUDACyclone, clone the repository and type **make**  
-For totaly clean system (big thanks for **dev_nullish**):
+## 🛠️ Setup & Build
+
+### Linux
 ```bash
-apt update;
-apt-get install -y joe;
-apt-get install -y zip;
-apt-get install -y screen;
-apt-get install -y curl libcurl4;
-apt-get install build-essential;
-apt-get install -y gcc;
-apt-get install -y make;
-apt install cuda-toolkit;
-git clone https://github.com/Dookoo2/CUDACyclone.git
+# Automatic setup — detects CUDA, installs dependencies, builds
+git clone https://github.com/jmr2704/CUDACyclone.git
+cd CUDACyclone
+bash setup.sh
+```
+
+Or manually (if CUDA and build tools are already installed):
+```bash
 make
 ```
+
+### Windows
+```powershell
+# Automatic setup — detects CUDA Toolkit, Visual Studio, make, builds
+git clone https://github.com/jmr2704/CUDACyclone.git
+cd CUDACyclone
+.\setup.ps1
+```
+
+### How it works
+- The **Makefile** automatically detects your GPU compute capability and generates optimized code for architectures 75, 86, 89 + yours.
+- **setup.sh** (Linux) installs CUDA Toolkit, build-essential and compiles.
+- **setup.ps1** (Windows) detects CUDA Toolkit, Visual Studio, make and compiles.
+- Both scripts detect the latest CUDA version available on your system.
+- Running `make` directly also works — falls back to `86` if no GPU is detected.
 ## 🚧**Version**
 **V1.3**: Full CUDA Kernel rewrite again for preventing key skipping.    
 **V1.2**: Full CUDA Kernel rewrite.  
@@ -208,5 +222,13 @@ make
 
 
 
+---
+## 📜 Credits
+
+This repository is a fork with modifications of the original [CUDACyclone](https://github.com/Dookoo2/CUDACyclone) by **Dookoo2**.  
+Thanks to the original work that served as the foundation for this project.
+
+---
+
 ## ✌️**TIPS**
-BTC: bc1qtq4y9l9ajeyxq05ynq09z8p52xdmk4hqky9c8n
+BTC: bc1q7s4m9cwlq8xtx2nz74mquh6ax0jqwsmkkd56s3
