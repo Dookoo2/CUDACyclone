@@ -14,20 +14,20 @@ SRC         := CUDACyclone.cu CUDAHash.cu
 OBJ         := $(SRC:.cu=$(OBJ_EXT))
 CC          := nvcc
 
-# Detecta compute capability da GPU automaticamente
+# Detecta compute capability de TODAS as GPUs instaladas
 # Windows: usa PowerShell (consegue acessar nvidia-smi no PATH)
 # Linux: usa shell normal
 ifeq ($(OS),Windows_NT)
-  GPU_ARCH ?= $(strip $(shell powershell -NoProfile -Command "try{ (nvidia-smi --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1).Trim() -replace '\.','' }catch{''}" 2>nul))
+  GPU_ARCHS ?= $(sort $(strip $(shell powershell -NoProfile -Command "try{ (nvidia-smi --query-gpu=compute_cap --format=csv,noheader) -replace '\.','' -join ' ' }catch{''}" 2>nul)))
 else
-  GPU_ARCH ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '.')
+  GPU_ARCHS ?= $(sort $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed 's/\.//' | tr '\n' ' '))
 endif
-ifeq ($(GPU_ARCH),)
-  GPU_ARCH := 86
-  $(warning nvidia-smi nao disponivel. Usando GPU_ARCH=86 como fallback.)
+ifeq ($(GPU_ARCHS),)
+  GPU_ARCHS := 86
+  $(warning nvidia-smi nao disponivel. Usando GPU_ARCHS=86 como fallback.)
 endif
 
-SM_ARCHS   := 75 86 89 $(GPU_ARCH)
+SM_ARCHS   := $(sort 75 86 89 $(GPU_ARCHS))
 GENCODE    := $(foreach arch,$(SM_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch))
 
 NVCC_FLAGS := -O3 -rdc=true -use_fast_math --ptxas-options=-O3 -allow-unsupported-compiler $(GENCODE)
